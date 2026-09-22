@@ -9,6 +9,7 @@ import io
 import os
 from typing import Optional
 
+
 # ========== Imports ==========
 try:
     import pdfplumber

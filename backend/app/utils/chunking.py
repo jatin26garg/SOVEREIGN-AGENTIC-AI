@@ -3,7 +3,7 @@ from typing import List,Dict,Any
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-def chunk_text(text :str,chunk_size:int = 500,chunk_overlap:int = 50)->List[str]:
+def chunk_text(text :str,chunk_size:int = 1000,chunk_overlap:int = 150)->List[str]:
 
     text = re.sub(r'\s+',' ',text).strip()
 

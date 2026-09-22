@@ -2,9 +2,7 @@ import os
 import uuid
 from typing import List, Dict,Any , Tuple, Optional
 from datetime import datetime
-import chromadb
-from chromadb.config import Settings as ChromaSettings
-from langchain_google_genai import GoogleGenerativeAIEmbeddings,ChatGoogleGenerativeAI
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -53,7 +51,7 @@ class RAGService:
         self.prompt = ChatPromptTemplate.from_template("""
                     You are a helpful assistant that answers questions based on the provided context.
 
-IMPORTANT RULES:
+    IMPORTANT RULES:
 1. Answer ONLY using the context provided below.
 2. If the answer is not in the context, say "I don't have information about that."
 3. DO NOT make up information.
@@ -288,8 +286,8 @@ ANSWER:
                 "file_name": file_name,
                 "uploadedAt": datetime.now().isoformat(),
             },
-            chunk_size=500,
-            chunk_overlap=50
+            chunk_size=1000,
+            chunk_overlap=150
         )
         
         print(f" created {len(chunks_with_metadata)} chunks")
@@ -305,7 +303,7 @@ ANSWER:
         # the LLM. This fixes "tell me about X.pdf" questions.
         # ============================================================
         enriched_chunks = [
-            f"[File: {file_name}]\n\n{chunk['content']}"
+            f"[File: {chunk['content']}"
             for chunk in chunks_with_metadata
         ]
         
