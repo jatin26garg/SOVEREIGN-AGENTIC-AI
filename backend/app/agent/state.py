@@ -19,3 +19,23 @@ class AgentState(TypedDict, total = False):
     
     iteration: int                     
     tool_calls: List[str]
+
+    # Router (router_node / route_after_router in nodes.py)
+    route: str            # "documents" | "direct" | "clarify"
+    route_reason: str
+
+    # Reflection loop (critique_node / should_reflect in nodes.py)
+    critique_score: int
+    critique_feedback: str
+    critique_count: int
+    max_critiques: int
+    needs_retry: bool
+
+    # Adaptive replanning (replan_node / route_after_execute in nodes.py)
+    needs_replan: bool
+    replan_count: int
+    max_replans: int
+    last_failure: Dict[str, Any]
+    search_query: str
+    tried_queries: List[str]
+    unrecoverable: bool
