@@ -69,6 +69,15 @@ Claude or Codex — until now.
 
 ---
 
+## AGENT GRAPH
+init → router ─┬─ end (greeting/vague) ────────────────────────────────→ DONE
+                └─ plan → execute_step ─┬─ ok, more steps ──→ execute_step (loop)
+                                        ├─ ok, done ────────→ finalize
+                                        └─ fail/empty ──────→ replan ─┬─→ execute_step
+                                                                      └─→ finalize
+                                                                            │
+                                                            finalize → critique ─┬─ retry ─→ plan
+                                                                                 └─ done ──→ DONE
 ## 🏗️ Architecture
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
