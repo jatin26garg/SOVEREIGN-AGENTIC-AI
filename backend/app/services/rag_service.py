@@ -6,7 +6,7 @@ from datetime import datetime
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatMessagePromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -39,14 +39,13 @@ class RAGService:
             use_fp16=False,
             device="cpu"
         )
-        print(f" connecting to ollama model")
-        self.llm = ChatOllama(
-            model= settings.CHAT_MODEL,
-            base_url= settings.OLLAMA_BASE_URL,
-            temperature = 0.3,
-            disable_streaming=False,
+        print(f" connecting to Gemini ({settings.GEMINI_MODEL})")
+        self.llm = ChatGoogleGenerativeAI(
+            model=settings.GEMINI_MODEL,
+            google_api_key=settings.GEMINI_API_KEY,
+            temperature=0.3,
         )
-        print(f" qwen model is connected")
+        print(f" Gemini model is connected")
         
         self.prompt = ChatPromptTemplate.from_template("""
                     You are a helpful assistant that answers questions based on the provided context.
@@ -70,6 +69,9 @@ ANSWER:
 """)
         self._documents = {}
         self._ensure_collection_exists()
+        
+        self._rebuild_documents_from_qdrant()
+
 
     def _ensure_collection_exists(self):
         collections = self.client.get_collections().collections
@@ -268,7 +270,8 @@ ANSWER:
  
         
     def process_document(self, file_content: bytes, file_name: str) -> str:
-    
+        
+        print(f" PROCCESSING DOCUMENT  *** \n")
         print(f"extracting text from  :{file_name}")
         
         text = extract_text_from_file(file_content, file_name)
@@ -357,7 +360,8 @@ ANSWER:
             "chunk_count": len(chunks_with_metadata),
             "uploaded_at": datetime.now().isoformat(),
         }
-        
+        print(f"self._documents = {self._documents}\n\n")
+        print(f" PROCCESSING DOCUMENT DONE *** \n\n")
         return doc_id  
 
     # Phrases that signal the user wants the WHOLE document (every item,
@@ -441,10 +445,15 @@ ANSWER:
         return chunks
 
     def _answer_from_context(self, question: str, context_parts: List[str], source_info: List[Dict[str, Any]]) -> Dict[str, Any]:
+        
+        print("_answer_from_context \n\n\n\n")
         context = "\n\n".join(context_parts)
 
+        print(f"CONTEXT = {context } \n\n\n")
+        
+        
         print(f" generating answer --")
-        print(f"   Generating answer with {settings.CHAT_MODEL}...")
+        print(f"   Generating answer with {settings.GEMINI_MODEL}...")
 
         chain = (
             {
@@ -460,16 +469,69 @@ ANSWER:
             "context": context,
             "question": question,
         })
-
+        print(f"ANSWER = {answer} \n\n\n")
         return {
             "success": True,
             "answer": answer,
             "sources": source_info,
         }
 
+
+    def get_chunk_count(self) -> int:
+        try:
+            info = self.client.get_collection(self.collection_name)
+            return info.points_count
+        except Exception:
+            return 0
+    def _rebuild_documents_from_qdrant(self):
+        """
+        Rebuild the in-memory _documents dict from Qdrant.
+        Called on startup so documents survive server restarts.
+        """
+        try:
+            # Scroll all points, group by document_id
+            docs = {}
+            offset = None
+
+            while True:
+                result = self.client.scroll(
+                    collection_name=self.collection_name,
+                    limit=1000,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points, offset = result
+
+                for point in points:
+                    payload = point.payload or {}
+                    doc_id = payload.get("document_id")
+                    if not doc_id:
+                        continue
+
+                    if doc_id not in docs:
+                        docs[doc_id] = {
+                            "id": doc_id,
+                            "file_name": payload.get("file_name", "Unknown"),
+                            "uploaded_at": payload.get("uploaded_at", ""),
+                            "chunk_count": 0,
+                        }
+                    docs[doc_id]["chunk_count"] += 1
+
+                if offset is None:
+                    break
+
+            self._documents = docs
+            print(f"📚 Rebuilt _documents from Qdrant: {len(docs)} documents")
+
+        except Exception as e:
+            print(f"⚠️ Could not rebuild documents: {e}")
+            self._documents = {}
+
     def query(self, question:str, top_k: int = 6)->Dict[str,Any]:
-        
-        if not self._documents:
+        print(f"ENTERED QUERY FUNCTION ** \n\n")
+        print(f"self._documents = {self._documents}\n\n")
+        if self.get_chunk_count() == 0:
             return{
                 "answer"  : ("no documents have been been uploaded .. please upload the document first"),
                 "sources" : [],
@@ -480,6 +542,7 @@ ANSWER:
         # match chunks that merely repeat the word "question" (e.g. the
         # instructions header) while missing the actual question bodies.
         if self._is_exhaustive_query(question):
+            print("\n\n\n   EXHAUSTIVE QUERY \n\n\n")
             doc_id = self._latest_document_id()
             chunks = self.get_chunks_for_document(doc_id)
 
@@ -520,6 +583,8 @@ ANSWER:
             dense_weight=0.5,
             sparse_weight=0.5,
         )
+        
+        print(f"RESULTS in query = {results} \n\n\n")
         if not results:
             return {
                 "answer": "I couldn't find any relevant information in your documents.",
@@ -545,7 +610,9 @@ ANSWER:
                 "chunk_id":result["id"],
                 "content_preview"  :content[:200] + "..." if len(content) > 200 else content,
             })
-
+            
+            
+        print(f"EXITED QUERY FUNCTION ** \n\n")
         return self._answer_from_context(question, context_parts, source_info)
 
     def get_documents(self)->List[Dict[str,Any]]:

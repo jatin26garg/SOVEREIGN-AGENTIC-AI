@@ -70,14 +70,42 @@ Claude or Codex — until now.
 ---
 
 ## AGENT GRAPH
-init → router ─┬─ end (greeting/vague) ────────────────────────────────→ DONE
-                └─ plan → execute_step ─┬─ ok, more steps ──→ execute_step (loop)
-                                        ├─ ok, done ────────→ finalize
-                                        └─ fail/empty ──────→ replan ─┬─→ execute_step
-                                                                      └─→ finalize
-                                                                            │
-                                                            finalize → critique ─┬─ retry ─→ plan
-                                                                                 └─ done ──→ DONE
+
+[ENTRY: init]
+      │
+      ▼
+  [router]
+      │
+      ├── "end" ──────────────────────────────────────────┐
+      │                                                   │
+      └── "plan"                                          │
+            │                                             │
+            ▼                                             │
+         [plan] ◄─────────────────────────┐               │
+            │                             │               │
+            ▼                             │               │
+     [execute_step] ◄── "exec" ───┐       │               │
+            │                     │       │               │
+            ├── "replan" ──► [replan]     │               │
+            │                  │          │               │
+            └── "fin" ─────────┼──────────┼───────────┐   │
+                               │          │           │   │
+                               ▼          │           │   │
+                         (finalize) ──────┘           │   │
+                               │                      │   │
+                               ▼                      │   │
+                          [finalize]                  │   │
+                               │                      │   │
+                               ▼                      │   │
+                          [critique]                  │   │
+                               │                      │   │
+                     ┌── "retry" ──────────────────────┘   │
+                     │                                    │
+                     └── "done" ───────────────────────────┴──► [END]
+
+
+
+                     
 ## 🏗️ Architecture
 
 ┌─────────────────────────────────────────────────────────────────────────────┐

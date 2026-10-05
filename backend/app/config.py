@@ -18,6 +18,14 @@ class Settings:
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     CHAT_MODEL: str = os.getenv("CHAT_MODEL", "qwen3:8b")
 
+    # Gemini (replaces Ollama as the text LLM for rag_service + the agent).
+    # gemini-3.5-flash is GA-stable as of Oct 2026; the entire Gemini 2.5
+    # line (pro/flash/flash-lite) is scheduled for shutdown Oct 16 2026,
+    # so avoid defaulting to those even though they're still common in
+    # older examples.
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+
     DENSE_VECTOR_SIZE: int = 1024
     SPARSE_VECTOR_SIZE:int = 250000  
 
@@ -48,6 +56,12 @@ class Settings:
     ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 
     def __init__(self):
+        if not self.GEMINI_API_KEY:
+            print(
+                " WARNING: GEMINI_API_KEY is not set. Set it in your .env "
+                "file - every LLM call (planning, routing, answers) will "
+                "fail with an auth error until you do."
+            )
         self.WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
         (self.WORKSPACE_DIR / "inputs").mkdir(exist_ok=True)
         (self.WORKSPACE_DIR / "outputs").mkdir(exist_ok=True)

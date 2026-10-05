@@ -1,7 +1,7 @@
 import re
 import json
 
-from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
 from app.config import settings
 from app.agent.state import AgentState
 from app.agent.tools import rag_search,write_output
@@ -9,18 +9,27 @@ from app.agent.tools import rag_search,write_output
 from datetime import datetime
 
 
-_llm = ChatOllama(model= settings.CHAT_MODEL ,
-                  base_url=settings.OLLAMA_BASE_URL,
-                  temperature=0.2,
-                  format= 'json'
-                  )
+# response_mime_type="application/json" is Gemini's equivalent of Ollama's
+# format='json' - constrains the output to valid JSON at the API level, so
+# _clean_json()/_extract_plan_list() below still matter only as a defensive
+# second layer (e.g. in case the model wraps JSON in markdown anyway), not
+# as the primary mechanism.
+_llm = ChatGoogleGenerativeAI(
+    model=settings.GEMINI_MODEL,
+    google_api_key=settings.GEMINI_API_KEY,
+    temperature=0.2,
+    response_mime_type="application/json",
+)
 
 
 def _clean_json(raw: str) -> str:
     """
-    qwen3 emits <think>...</think> reasoning before its actual answer.
-    Strip that out, then pull the first {...} or [...] block so json.loads
-    doesn't choke on stray reasoning text or markdown fences.
+    Defensive cleanup before json.loads(). <think>...</think> stripping was
+    originally for qwen3 (via Ollama); Gemini doesn't emit that, so this is
+    a no-op for it, but harmless to keep as a safety net if the model is
+    ever swapped again. The markdown-fence/brace-extraction still matters:
+    Gemini's response_mime_type="application/json" constrains output at
+    the API level, but this stays as defense in depth regardless.
     """
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
@@ -162,8 +171,10 @@ _ROUTER_SYSTEM = (
 
 
 def _extract_route(parsed, task: str) -> dict | None:
+    print(f"INSIDE _EXTRACT_ROUTE -- \n")
     """Tolerant parse of the router JSON, plus deterministic guards so a
     model misfire can never swallow a real question."""
+    print(f"parsed message in _extract_route = {parsed} \n")
     if not isinstance(parsed, dict):
         return None
     route = str(parsed.get("route", "")).strip().lower()
@@ -172,13 +183,40 @@ def _extract_route(parsed, task: str) -> dict | None:
     reply = str(parsed.get("reply") or "").strip()
     reason = str(parsed.get("reason") or "").strip()
     words = len(task.split())
-
+    
+   
+    print(f"route = {route}\n")
+    print(f"reply = {reply}\n")
+    print(f"reason = {reason}\n")
+    print(f"words = {words}\n")
+    
+    
     if route == "clarify" and (not reply or words > _MAX_WORDS_CLARIFY):
         return {"route": "documents", "reply": "", "reason": f"clarify downgraded ({reason or 'guard'})"}
     if route == "direct" and (not reply or words > _MAX_WORDS_DIRECT):
         return {"route": "documents", "reply": "", "reason": f"direct downgraded ({reason or 'guard'})"}
+    
+    print(f"END OF __EXTRACT_ROUTE")
+    
     return {"route": route, "reply": reply if route != "documents" else "", "reason": reason}
 
+
+def _extract_text(content) -> str:
+    """Normalize LLM content (str or list of blocks) into a single string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if "text" in block:
+                    parts.append(block["text"])
+            elif hasattr(block, "text"):
+                parts.append(block.text)
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return str(content)
 
 def router_node(state: AgentState) -> AgentState:
     """
@@ -187,22 +225,30 @@ def router_node(state: AgentState) -> AgentState:
     exactly the behaviour the agent had before the router existed.
     """
     task = state["task"]
+    print(f"task = {task} \n")
     decision = _route_by_rules(task)
+    print(f"Decision in router_node = {decision} \n")
     llm_used = False
     raw_content = None
 
     if decision is None:
+        print(f"enter here ***\n")
         llm_used = True
         try:
             resp = _llm.invoke([
                 {"role": "system", "content": _ROUTER_SYSTEM},
                 {"role": "user", "content": task},
             ])
-            raw_content = resp.content
+            
+            raw_content = _extract_text(resp.content)
+            print(f"response content by llm in router_node = {resp.content} \n")
             decision = _extract_route(json.loads(_clean_json(raw_content)), task)
+            print(f"Decision in router_node = {decision}")
+            
             if decision is None:
                 raise ValueError(f"router returned malformed output (raw: {raw_content!r})")
         except Exception as e:
+            print(f"exception occured in router_node = {e}\n")
             decision = {"route": "documents", "reply": "", "reason": "router unavailable - default route"}
             state["errors"].append(f"router_node fallback used : {e}")
 
@@ -227,6 +273,7 @@ def route_after_router(state: AgentState) -> str:
 
 
 def plan_node(state: AgentState)->AgentState:
+    print(f"PLAN NODE START -- \n")
     """
     Ask the LLM to break the task into a short ordered list of concrete
     steps. One planning call up front is far cheaper than re-planning on
@@ -251,6 +298,7 @@ def plan_node(state: AgentState)->AgentState:
     try:
         user_content = state["task"]
         if state.get("critique_feedback"):
+            print(f"Entered critique_feedback in PLAN NODE \n")
             # This is a retry after a reflection cycle judged the previous
             # answer insufficient - tell the planner what was wrong so it
             # doesn't just regenerate the same plan and fail the same way.
@@ -265,9 +313,14 @@ def plan_node(state: AgentState)->AgentState:
             {"role" : "user" , "content" : user_content}
         ])
         raw_content = resp.content
+        
+        print(f"RAW_CONNTENT = {raw_content} \n")
  
         parsed = json.loads(_clean_json(raw_content))
+        print(f"PARSED_CONNTENT = {parsed} \n")
+        
         plan = _extract_plan_list(parsed)
+        print(f"PLAN = {plan} \n")
  
         if not plan:
             raise ValueError(f"planner returned an empty or malformed plan (raw: {raw_content!r})")
@@ -281,7 +334,10 @@ def plan_node(state: AgentState)->AgentState:
         filename = _extract_filename(state["task"])
         if filename:
             state["file_path"] = f"outputs/{filename}"
+    print(f"State = {state}\n")
+    print(f"PLAN NODE END -- \n")
     return state
+    
  
 _WRITE_KEYWORDS = ("save", "write", "export", "store", "persist")
 
@@ -323,12 +379,19 @@ def execute_step_node(state:AgentState)->AgentState:
     budget left, it flags needs_replan so the graph routes through
     replan_node instead of marching blindly to the next step.
     """
-    
+    print(f"execute_step_node START \n")
     idx = state["current_step"]
     step = state["plan"][idx]
     state["needs_replan"] = False
     
+    print(f"INDEX = {idx} \n")
+    print(f"STEP = {step} \n\n")
+    
+    
     is_write_step = any(kw in step.lower() for kw in _WRITE_KEYWORDS)
+    
+    print(f"is_write_step = {is_write_step}\n\n")
+    
     failure = None
     
     if is_write_step:
@@ -341,6 +404,7 @@ def execute_step_node(state:AgentState)->AgentState:
             state["errors"].append(result["error"])
         else:
             path = state["file_path"]  or "outputs/agent_answer.md" 
+            print(f"path = {path}\n\n")
             result = write_output(path=path, content=content)
             state["tool_calls"].append(f"write_output({path})")
             
@@ -351,7 +415,15 @@ def execute_step_node(state:AgentState)->AgentState:
     else:
         # A replan may have supplied a rewritten query; otherwise use the task.
         query = state.get("search_query") or state["task"]
+        
+        
+        print(f"RAG BLOCK \n\n")
+        print(f"query = {query} \n\n")
+        
         result = rag_search(query=query)
+        
+        
+        print(f"RAG_SEARCH RESULT = {result} \n\n")
         state["tool_calls"].append(f"rag_search({query[:60]!r})")
         state.setdefault("tried_queries", []).append(query)
         
@@ -370,7 +442,7 @@ def execute_step_node(state:AgentState)->AgentState:
     state["memory"].append({"node": "execute_step", "step": step, "result": result})
     state["current_step"] += 1
     state["iteration"] +=1
-    
+    print(f"failure = {failure} \n\n")
     if failure:
         has_budget = (
             state.get("replan_count", 0) < state.get("max_replans", 2)
@@ -384,7 +456,8 @@ def execute_step_node(state:AgentState)->AgentState:
                 "kind": failure["kind"],
                 "detail": failure["detail"],
             }
-    
+    print(f"STATE = {state} \n \n \n")
+    print(f"execute_step_node END \n")
     return state
 
 def should_continue(state:AgentState)->str:
@@ -586,6 +659,8 @@ def critique_node(state: AgentState) -> AgentState:
     this project before (see should_continue's history). should_reflect
     only ever reads what this node already decided.
     """
+    
+    print(f"ENTERED critique_node \n\n\n\n")
     state.setdefault("critique_count", 0)
     state.setdefault("max_critiques", 2)
 
@@ -653,6 +728,8 @@ def critique_node(state: AgentState) -> AgentState:
         "will_retry": should_retry,
         "raw_llm_response": raw_content,
     })
+    
+    print(f"end of CRITIQUE NODE \n\n\n\n\n")
     return state
 
 

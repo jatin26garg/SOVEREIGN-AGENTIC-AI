@@ -13,7 +13,7 @@ rag = get_rag_service()
 
 app = FastAPI(
     title="Document RAG API",
-    description="Upload documents and ask questions with RAG (Qwen3:8B + Qdrant)",
+    description="Upload documents and ask questions with RAG (Gemini + Qdrant)",
     version='3.0.0',
 )
 
@@ -44,6 +44,9 @@ class AgentExecuteRequest(BaseModel):
     task: str
     file_path: Optional[str] = None
     max_steps: Optional[int] = 6
+    # 0 disables the feature; None means "use the agent's default (2)".
+    max_replans: Optional[int] = None
+    max_critiques: Optional[int] = None
 
 @app.post("/agent/execute")
 async def execute_agent(request: AgentExecuteRequest):
@@ -54,7 +57,9 @@ async def execute_agent(request: AgentExecuteRequest):
         result = run_agent(
             task=request.task,
             file_path=request.file_path,
-            max_steps=request.max_steps or 6
+            max_steps=request.max_steps or 6,
+            max_replans=2 if request.max_replans is None else request.max_replans,
+            max_critiques=2 if request.max_critiques is None else request.max_critiques,
         )
 
         # Return the most useful fields for the frontend
@@ -67,6 +72,11 @@ async def execute_agent(request: AgentExecuteRequest):
             "errors": result.get("errors", []),
             "memory": result.get("memory", []),
             "plan": result.get("plan", []),
+            "route": result.get("route", ""),
+            "route_reason": result.get("route_reason", ""),
+            "replan_count": result.get("replan_count", 0),
+            "critique_count": result.get("critique_count", 0),
+            "critique_score": result.get("critique_score"),
         }
     except Exception as e:
         raise HTTPException(500, detail=f"Agent execution failed: {str(e)}")
