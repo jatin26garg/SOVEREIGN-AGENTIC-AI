@@ -19,24 +19,166 @@ _llm = ChatGoogleGenerativeAI(
     google_api_key=settings.GEMINI_API_KEY,
     temperature=0.2,
     response_mime_type="application/json",
-)
+)   
 
+_MAX_CONVERSATION_MESSAGES = 12
+_MAX_CONVERSATION_CHARS = 8000
 
-def _clean_json(raw: str) -> str:
+def _append_conversation_turn(state: AgentState) -> None:
+    """Persist the user/assistant exchange for the current API turn.
+
+    A critique retry can reach finalize more than once in one turn. In that
+    case update the existing assistant message instead of duplicating the user
+    message in conversation history.
     """
-    Defensive cleanup before json.loads(). <think>...</think> stripping was
-    originally for qwen3 (via Ollama); Gemini doesn't emit that, so this is
-    a no-op for it, but harmless to keep as a safety net if the model is
-    ever swapped again. The markdown-fence/brace-extraction still matters:
-    Gemini's response_mime_type="application/json" constrains output at
-    the API level, but this stays as defense in depth regardless.
+    
+    print(f"---ENTERED _append_conversation_turn FUNCTION \n\n\n\n")
+    
+    history = state.setdefault("conversation_history", [])
+    task = str(state.get("task", "")).strip()
+    answer = str(state.get("final_answer", "")).strip()
+
+    if not task:
+        return
+
+    if state.get("turn_history_saved"):
+        for index in range(len(history) - 1, -1, -1):
+            message = history[index]
+            if (
+                message.get("role") == "user"
+                and message.get("content") == task[:_MAX_CONVERSATION_CHARS]
+            ):
+                if index + 1 < len(history) and history[index + 1].get("role") == "assistant":
+                    history[index + 1]["content"] = answer[:_MAX_CONVERSATION_CHARS]
+                elif answer:
+                    history.insert(index + 1, {
+                        "role": "assistant",
+                        "content": answer[:_MAX_CONVERSATION_CHARS],
+                    })
+                return
+        return
+
+    history.append({
+        "role": "user",
+        "content": task[:_MAX_CONVERSATION_CHARS],
+    })
+    if answer:
+        history.append({
+            "role": "assistant",
+            "content": answer[:_MAX_CONVERSATION_CHARS],
+        })
+
+    # Bound both prompt size and checkpoint growth while keeping recent turns.
+    if len(history) > _MAX_CONVERSATION_MESSAGES:
+        del history[:-_MAX_CONVERSATION_MESSAGES]
+
+    state["turn_history_saved"] = True
+
+def _conversation_context(state: AgentState) -> str:
+    
+    """Format recent conversation turns for the planner."""
+    history = state.get("conversation_history", [])
+    if not history:
+        return "No previous conversation turns."
+
+    lines = []
+    for message in history[-_MAX_CONVERSATION_MESSAGES:]:
+        role = message.get("role", "unknown")
+        content = str(message.get("content", "")).strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines) or "No previous conversation turns."
+
+    
+
+def _clean_json(raw) -> str:
     """
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    match = re.search(r"(\{.*\}|\[.*\])", raw, flags=re.DOTALL)
+    Normalize ChatOllama content into a plain string, then clean JSON.
+    Handles both string content and list-of-content-block responses.
+    """
+
+    if isinstance(raw, list):
+        parts = []
+
+        for item in raw:
+            if isinstance(item, str):
+                parts.append(item)
+
+            elif isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item["text"]))
+                elif "content" in item:
+                    parts.append(str(item["content"]))
+
+        raw = "\n".join(parts)
+
+    elif not isinstance(raw, str):
+        raw = str(raw)
+
+    raw = re.sub(
+        r"<think>.*?</think>",
+        "",
+        raw,
+        flags=re.DOTALL
+    ).strip()
+
+    raw = raw.replace("```json", "")
+    raw = raw.replace("```", "").strip()
+
+    match = re.search(
+        r"(\{.*\}|\[.*\])",
+        raw,
+        flags=re.DOTALL
+    )
+
     return match.group(1) if match else raw
 
+
 def _init_node(state : AgentState) ->AgentState:
+    
+    print("---ENTERED INTIT_NODE --- \n\n\n")
+    
+    state.setdefault("conversation_history", [])
+    state.setdefault("last_answer", "")
+    state.setdefault("last_file_path", "")
+    state.setdefault("preserve_last_answer", False)
+    state.setdefault("turn_history_saved", False)
+    state.setdefault("thread_id", "default")
+    state.setdefault("turn_count", 0)
+    
+    
+    
+    # A checkpointer restores the previous graph state before the new
+    # invocation starts. Reset per-turn execution state, but deliberately keep
+    # conversation_history and last_answer so follow-ups can refer to them.
+    if state.get("new_turn", False):
+        if state.get("final_answer") and not state.get("last_answer"):
+            state["last_answer"] = state["final_answer"]
+            
+    state["plan"] = []
+    state["current_step"] = 0
+    state["rag_results"] = []
+    state["final_answer"] = ""
+    state["preserve_last_answer"] = False
+    state["turn_history_saved"] = False
+    state["memory"] = []
+    state["errors"] = []
+    state["iteration"] = 0
+    state["tool_calls"] = []
+    state["route"] = ""
+    state["route_reason"] = ""
+    state["critique_count"] = 0
+    state["critique_feedback"] = ""
+    state["needs_retry"] = False
+    state["needs_replan"] = False
+    state["replan_count"] = 0
+    state["last_failure"] = {}
+    state["search_query"] = ""
+    state["tried_queries"] = []
+    state["unrecoverable"] = False
+    state["turn_count"] = state.get("turn_count", 0) + 1
+    state["new_turn"] = False
+    
     state.setdefault("plan" ,[])
     state.setdefault("current_step",0)
     state.setdefault("max_steps",6)
@@ -60,6 +202,7 @@ def _init_node(state : AgentState) ->AgentState:
     state.setdefault("unrecoverable", False)
     state["start_time"] = datetime.now().isoformat()
     
+    print("---EXITED INTIT_NODE --- \n\n\n")
     return state
 
 def _extract_plan_list(parsed):
@@ -224,6 +367,9 @@ def router_node(state: AgentState) -> AgentState:
     ambiguous messages, and on ANY failure default to "documents" - i.e.
     exactly the behaviour the agent had before the router existed.
     """
+    
+    print("--ENTERD ROUTER_NODE \n\n\n")
+    
     task = state["task"]
     print(f"task = {task} \n")
     decision = _route_by_rules(task)
@@ -254,8 +400,11 @@ def router_node(state: AgentState) -> AgentState:
 
     state["route"] = decision["route"]
     state["route_reason"] = decision["reason"]
+    
     if decision["route"] in ("direct", "clarify"):
         state["final_answer"] = decision["reply"]
+        state["last_answer"] = state["final_answer"]
+        _append_conversation_turn(state)
 
     state["memory"].append({
         "node": "router",
@@ -264,16 +413,20 @@ def router_node(state: AgentState) -> AgentState:
         "llm_used": llm_used,
         "raw_llm_response": raw_content,
     })
+    print("--EXITED ROUTER_NODE \n\n\n")
     return state
 
 
 def route_after_router(state: AgentState) -> str:
     """Pure router: only the documents route runs the plan/search pipeline."""
+    print("---ENTERED  AND LEFT route_after_router NODE \n\n\n")
     return "plan" if state.get("route", "documents") == "documents" else "end"
 
 
 def plan_node(state: AgentState)->AgentState:
+    
     print(f"PLAN NODE START -- \n")
+    
     """
     Ask the LLM to break the task into a short ordered list of concrete
     steps. One planning call up front is far cheaper than re-planning on
@@ -291,40 +444,73 @@ def plan_node(state: AgentState)->AgentState:
         'Respond with ONLY a JSON object of the form {"steps": [...]}, '
         "where the value is a list of short step strings, nothing else. "
         'Example: {"steps": ["Search the PDFs for the refund policy", '
-        '"Save the answer to refund_policy.md"]}'
+        '"Save the answer to refund_policy.md"]}.\n'
+        "The user may refer to an earlier answer with words such as 'it', 'that', "
+        "'this', or 'the previous answer'. Resolve those references using the "
+        "conversation context. A request such as 'save that' should become a "
+        "write_output step that uses the previous assistant answer."
     )
     
     raw_content = None
     try:
-        user_content = state["task"]
-        if state.get("critique_feedback"):
-            print(f"Entered critique_feedback in PLAN NODE \n")
-            # This is a retry after a reflection cycle judged the previous
-            # answer insufficient - tell the planner what was wrong so it
-            # doesn't just regenerate the same plan and fail the same way.
-            user_content += (
-                f"\n\nNote: a previous attempt at this task was judged "
-                f"insufficient. Feedback: {state['critique_feedback']}\n"
-                f"Try a different or more thorough approach this time."
+        task_lower = state["task"].lower()
+        reference_words = re.search(
+            r"\b(that|it|this|previous\s+answer|last\s+answer|same)\b",
+            task_lower,
+        )
+        # The most important conversational follow-up can be handled
+        # deterministically: "save/write/export that/it/this" refers to the
+        # checkpointed previous answer, so there is no need to ask the planner
+        # LLM to rediscover that reference.
+        is_reference_write = (
+            bool(state.get("last_answer"))
+            and bool(reference_words)
+            and any(kw in task_lower for kw in _WRITE_KEYWORDS)
+        )
+        
+        if is_reference_write:
+            plan = ["save the previous assistant answer to a file"]
+        else:
+            
+            user_content = (
+                "Conversation so far:\n"
+                f"{_conversation_context(state)}\n\n"
+                "Previous answer available for follow-up requests:\n"
+                f"{state.get('last_answer', '') or '(none)'}\n\n"
+                f"Current request:\n{state['task']}"
             )
+            
+            print(f"user_content = {user_content} \n\n")
+        
+            if state.get("critique_feedback"):
+                print(f"Entered critique_feedback in PLAN NODE \n")
+                # This is a retry after a reflection cycle judged the previous
+                # answer insufficient - tell the planner what was wrong so it
+                # doesn't just regenerate the same plan and fail the same way.
+                user_content += (
+                    f"\n\nNote: a previous attempt at this task was judged "
+                    f"insufficient. Feedback: {state['critique_feedback']}\n"
+                    f"Try a different or more thorough approach this time."
+                )
 
-        resp = _llm.invoke([
-            {"role" : "system",  "content" : system},
-            {"role" : "user" , "content" : user_content}
-        ])
-        raw_content = resp.content
-        
-        print(f"RAW_CONNTENT = {raw_content} \n")
- 
-        parsed = json.loads(_clean_json(raw_content))
-        print(f"PARSED_CONNTENT = {parsed} \n")
-        
-        plan = _extract_plan_list(parsed)
-        print(f"PLAN = {plan} \n")
- 
-        if not plan:
-            raise ValueError(f"planner returned an empty or malformed plan (raw: {raw_content!r})")
+            resp = _llm.invoke([
+                {"role" : "system",  "content" : system},
+                {"role" : "user" , "content" : user_content}
+            ])
+            raw_content = resp.content
+            
+            print(f"\nRAW_CONNTENT = {raw_content} \n")
+    
+            parsed = json.loads(_clean_json(raw_content))
+            print(f"PARSED_CONNTENT = {parsed} \n")
+            
+            plan = _extract_plan_list(parsed)
+            print(f"PLAN = {plan} \n")
+    
+            if not plan:
+                raise ValueError(f"planner returned an empty or malformed plan (raw: {raw_content!r})")
     except Exception as e:
+        print(f"\n ERROR OCCURED IN PLAN_NODE {e}\n\n")
         plan = ["search the pdfs to answer the task"]
         state['errors'].append(f"plan_node fallback used : {e}")
         
@@ -332,6 +518,7 @@ def plan_node(state: AgentState)->AgentState:
     state['memory'].append({"node" : "plan" , "plan" : plan, "raw_llm_response": raw_content})
     if not state.get("file_path"):
         filename = _extract_filename(state["task"])
+        print(f"FILE NAME = {filename} \n\n")
         if filename:
             state["file_path"] = f"outputs/{filename}"
     print(f"State = {state}\n")
@@ -395,8 +582,13 @@ def execute_step_node(state:AgentState)->AgentState:
     failure = None
     
     if is_write_step:
-        content = state["final_answer"] or "\n\n".join(_usable_answers(state))
         
+        content = (
+            state["final_answer"]
+            or state.get("last_answer", "")
+            or "\n\n".join(_usable_answers(state))
+        )
+                
         if not content.strip():
             # Don't write an empty/placeholder file - a saved "nothing
             # found" file looks like a successful result but isn't one.
@@ -412,6 +604,13 @@ def execute_step_node(state:AgentState)->AgentState:
                 state["errors"].append(result.get("error", "write_output failed"))
             else:
                 state["file_path"] = result["path"]
+                state["last_file_path"] = result["path"]
+                if not state.get("final_answer") and state.get("last_answer"):
+                    # Conversational "save that/it" follow-up: retain the
+                    # previous substantive answer in last_answer, while this
+                    # turn returns a concise save confirmation.
+                    state["preserve_last_answer"] = True
+                    state["final_answer"] = f"Saved the previous answer to {result['path']}."
     else:
         # A replan may have supplied a rewritten query; otherwise use the task.
         query = state.get("search_query") or state["task"]
@@ -475,6 +674,9 @@ def should_continue(state:AgentState)->str:
 def route_after_execute(state:AgentState)->str:
     """Pure router: replan if execute_step_node flagged a failure,
     otherwise fall through to the normal continue/finalize decision."""
+    
+    print("\n ENTERED ROUTE_AFTER_EXEUTE \n\n\n")
+    
     if state.get("needs_replan"):
         return "replan"
     return should_continue(state)
@@ -601,6 +803,7 @@ def finalize_node(state:AgentState)->AgentState:
     Compose the final answer from everything gathered. If retrieval never
     produced an answer, say so honestly instead of inventing one.
     """
+    print("\n ENTERED FINALISE NODE \n\n\n")
     
     if not state["final_answer"]:
         usable = _usable_answers(state)
@@ -611,7 +814,15 @@ def finalize_node(state:AgentState)->AgentState:
                 "I wasn't able to retrieve relevant information from the "
                 "PDFs to answer this task."
             )
+    if not state.get("preserve_last_answer"):
+        state["last_answer"] = state["final_answer"]
+        
+    _append_conversation_turn(state)
+
     state["memory"].append({"node": "finalize"})
+    
+    print("\n EXITED  FINALISE NODE \n\n\n")
+    
     return state
 
 
@@ -627,6 +838,8 @@ _CRITIQUE_SYSTEM = (
     "Mark sufficient=false only if the answer is genuinely incomplete, "
     "vague, or evasive - not just because it could theoretically be more "
     "detailed. A short but accurate and complete answer is sufficient."
+    "For an action-only task such as saving or exporting a previous answer, "
+    "a clear confirmation that the action succeeded is sufficient."
 )
 
 
@@ -661,6 +874,7 @@ def critique_node(state: AgentState) -> AgentState:
     """
     
     print(f"ENTERED critique_node \n\n\n\n")
+    
     state.setdefault("critique_count", 0)
     state.setdefault("max_critiques", 2)
 

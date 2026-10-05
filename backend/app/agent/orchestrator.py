@@ -2,12 +2,15 @@ from typing import Optional
 
 from langgraph.graph import StateGraph,END
 from app.agent.state import AgentState
+from langgraph.checkpoint.memory import InMemorySaver
+
 from app.agent.nodes import (
     _init_node, router_node, route_after_router, plan_node, execute_step_node, should_continue,
     route_after_execute, replan_node,
     finalize_node, critique_node, should_reflect,
 )
 
+_checkpointer = InMemorySaver()
 
 def build_agent():
     graph = StateGraph(AgentState)
@@ -47,11 +50,14 @@ def build_agent():
         "done": END,
     })
     
-    return graph.compile()
+    return graph.compile(checkpointer=_checkpointer)
+
+
+
 
 _agent = build_agent()
 
-def run_agent(task :str, file_path : Optional[str] = None, max_steps:int = 6, max_critiques: int = 2, max_replans: int = 2)->AgentState:
+def run_agent(task :str, file_path : Optional[str] = None, max_steps:int = 6, max_critiques: int = 2, max_replans: int = 2,thread_id: str = "default")->AgentState:
     """
     Run the agent end-to-end on a single task.
 
@@ -70,6 +76,8 @@ def run_agent(task :str, file_path : Optional[str] = None, max_steps:int = 6, ma
         max_replans: how many times the agent may recover from a failed or
                    empty search step (rewriting the query / skipping /
                    giving up) within a single planning attempt.
+        thread_id: stable conversation identifier. Calls using the same
+                   thread_id share checkpointed state.
 
     Returns:
         The final AgentState - `final_answer`, `rag_results`, `tool_calls`,
@@ -83,5 +91,20 @@ def run_agent(task :str, file_path : Optional[str] = None, max_steps:int = 6, ma
         "max_steps": max_steps,
         "max_critiques": max_critiques,
         "max_replans": max_replans,
+        "thread_id" : thread_id,
+        "new_turn": True,
     }
-    return _agent.invoke(initial_state)
+    config = {"configurable" : {"thread_id": thread_id}}
+    print(f"\n\nAGENT CALLED -- {thread_id} \n\n\n\n\n\n\n")
+    return _agent.invoke(initial_state, config)
+
+def get_agent_state(thread_id: str) -> dict:
+    """Read the latest checkpointed state for a conversation thread."""
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = _agent.get_state(config)
+    return snapshot.values if snapshot else {}
+
+
+def delete_agent_thread(thread_id: str) -> None:
+    """Delete all checkpointed state for a conversation thread."""
+    _checkpointer.delete_thread(thread_id)

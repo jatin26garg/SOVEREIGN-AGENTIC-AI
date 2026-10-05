@@ -14,6 +14,14 @@ class AgentState(TypedDict, total = False):
     final_answer : str
     
     memory : List[Dict[str,Any]]
+    conversation_history: List[Dict[str, str]]
+    last_answer: str
+    last_file_path: str
+    preserve_last_answer: bool
+    turn_history_saved: bool
+    thread_id: str
+    turn_count: int
+    new_turn: bool
     errors: List[str]
     start_time : str
     
