@@ -26,6 +26,8 @@ class Settings:
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
+    CHECKPOINT_DB_PATH : str = os.getenv("CHECKPOINT_DB_PATH", "")
+    
     DENSE_VECTOR_SIZE: int = 1024
     SPARSE_VECTOR_SIZE:int = 250000  
 

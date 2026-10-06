@@ -1,8 +1,16 @@
+import atexit
+import os
+import sqlite3
 from typing import Optional
+
+
+os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK","true")
+
 
 from langgraph.graph import StateGraph,END
 from app.agent.state import AgentState
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+from app.config import settings
 
 from app.agent.nodes import (
     _init_node, router_node, route_after_router, plan_node, execute_step_node, should_continue,
@@ -10,9 +18,30 @@ from app.agent.nodes import (
     finalize_node, critique_node, should_reflect,
 )
 
-_checkpointer = InMemorySaver()
+_checkpoint_db_path = settings.CHECKPOINT_DB_PATH
+
+_checkpoint_conn = sqlite3.connect(
+    str(_checkpoint_db_path),
+    check_same_thread=False,
+    timeout=30,
+)
+_checkpoint_conn.execute("PRAGMA journal_mode=WAL")
+_checkpoint_conn.commit()
+
+_checkpointer = SqliteSaver(_checkpoint_conn)
+_checkpointer.setup()
+
+def close_agent_checkpointer() -> None:
+    """Close the shared SQLite checkpoint connection on process exit."""
+    try:
+        _checkpoint_conn.close()
+    except Exception:
+        pass
+    
+atexit.register(close_agent_checkpointer)
 
 def build_agent():
+    
     graph = StateGraph(AgentState)
     
     graph.add_node("init",_init_node)
