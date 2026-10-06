@@ -1,5 +1,11 @@
 import os
 import uuid
+
+import copy
+from collections import OrderedDict
+from threading import RLock
+import unicodedata
+
 from typing import List, Dict,Any , Tuple, Optional
 from datetime import datetime
 
@@ -68,11 +74,79 @@ QUESTION:
 ANSWER:
 """)
         self._documents = {}
+        
+        
+        self._query_cache = OrderedDict()
+        self._query_cache_lock = RLock()
+        self._query_cache_hits = 0
+        self._query_cache_misses = 0
+        
         self._ensure_collection_exists()
         
         self._rebuild_documents_from_qdrant()
 
+    def _normalize_query(self, query: str) -> str:
+        """Normalize a query so harmless formatting differences share a cache entry."""
+        query = unicodedata.normalize("NFKC", str(query))
+        return " ".join(query.casefold().split())
+    
+    def _document_set_signature(self) -> Tuple:
+        """Return a stable signature for the currently indexed document set."""
+        documents = []
+        for doc_id, document in self._documents.items():
+            documents.append((
+                str(doc_id),
+                str(document.get("file_name", "")),
+                int(document.get("chunk_count", 0) or 0),
+                str(document.get("uploaded_at", "")),
+            ))
+        return tuple(sorted(documents))
+    
+    def _query_cache_key(self, question: str, top_k: int) -> Tuple:
+        """Build the cache key from normalized query + document set + result shape."""
+        return (
+            self._normalize_query(question),
+            self._document_set_signature(),
+            int(top_k),
+            bool(self._is_exhaustive_query(question)),
+        )
+    
+    def _get_cached_query(self, key: Tuple) -> Optional[Dict[str, Any]]:
+        with self._query_cache_lock:
+            cached = self._query_cache.get(key)
+            if cached is None:
+                self._query_cache_misses += 1
+                return None
 
+            # LRU refresh: most recently used entries move to the end.
+            self._query_cache.move_to_end(key)
+            self._query_cache_hits += 1
+            return copy.deepcopy(cached)
+        
+    def _set_cached_query(self, key: Tuple, result: Dict[str, Any]) -> None:
+        with self._query_cache_lock:
+            self._query_cache[key] = copy.deepcopy(result)
+            self._query_cache.move_to_end(key)
+
+        max_entries = max(1, int(settings.RAG_CACHE_MAX_ENTRIES))
+        while len(self._query_cache) > max_entries:
+            self._query_cache.popitem(last=False)
+
+    def clear_query_cache(self) -> None:
+        """Clear cached RAG responses, normally after document mutations."""
+        with self._query_cache_lock:
+            self._query_cache.clear()
+            
+    def get_query_cache_stats(self) -> Dict[str, Any]:
+        """Return lightweight cache metrics useful for debugging/observability."""
+        with self._query_cache_lock:
+            return {
+                "entries": len(self._query_cache),
+                "hits": self._query_cache_hits,
+                "misses": self._query_cache_misses,
+                "max_entries": int(settings.RAG_CACHE_MAX_ENTRIES),
+            }
+    
     def _ensure_collection_exists(self):
         collections = self.client.get_collections().collections
         
@@ -529,28 +603,38 @@ ANSWER:
             self._documents = {}
 
     def query(self, question:str, top_k: int = 6)->Dict[str,Any]:
-        print(f"ENTERED QUERY FUNCTION ** \n\n")
-        print(f"self._documents = {self._documents}\n\n")
-        if self.get_chunk_count() == 0:
-            return{
-                "answer"  : ("no documents have been been uploaded .. please upload the document first"),
-                "sources" : [],
+
+        cache_key = self._query_cache_key(question, top_k)
+        cached_result = self._get_cached_query(cache_key)
+        if cached_result is not None:
+            print(f" RAG cache HIT for: {self._normalize_query(question)}")
+            return cached_result
+
+        print(f" RAG cache MISS for: {self._normalize_query(question)}")
+
+        if not self._documents:
+            result = {
+                "answer": ("no documents have been been uploaded .. please upload the document first"),
+                "sources": [],
             }
+            self._set_cached_query(cache_key, result)
+            return result
 
         # "Tell me all the questions in this document" etc. needs the full
         # document, not a semantic top-k slice - a query like that can
         # match chunks that merely repeat the word "question" (e.g. the
         # instructions header) while missing the actual question bodies.
         if self._is_exhaustive_query(question):
-            print("\n\n\n   EXHAUSTIVE QUERY \n\n\n")
             doc_id = self._latest_document_id()
             chunks = self.get_chunks_for_document(doc_id)
 
             if not chunks:
-                return {
+                result = {
                     "answer": "I couldn't find any relevant information in your documents.",
                     "sources": [],
                 }
+                self._set_cached_query(cache_key, result)
+                return result
 
             context_parts = []
             source_info = []
@@ -573,7 +657,9 @@ ANSWER:
                     "content_preview": content[:200] + "..." if len(content) > 200 else content,
                 })
 
-            return self._answer_from_context(question, context_parts, source_info)
+            result = self._answer_from_context(question, context_parts, source_info)
+            self._set_cached_query(cache_key, result)
+            return result
 
         results = self.hybrid_search(
             query=question,
@@ -583,13 +669,13 @@ ANSWER:
             dense_weight=0.5,
             sparse_weight=0.5,
         )
-        
-        print(f"RESULTS in query = {results} \n\n\n")
         if not results:
-            return {
+            result = {
                 "answer": "I couldn't find any relevant information in your documents.",
                 "sources": [],
             }
+            self._set_cached_query(cache_key, result)
+            return result
         context_parts  = []
         source_info  = []
 
@@ -610,10 +696,10 @@ ANSWER:
                 "chunk_id":result["id"],
                 "content_preview"  :content[:200] + "..." if len(content) > 200 else content,
             })
-            
-            
-        print(f"EXITED QUERY FUNCTION ** \n\n")
-        return self._answer_from_context(question, context_parts, source_info)
+
+        result = self._answer_from_context(question, context_parts, source_info)
+        self._set_cached_query(cache_key, result)
+        return result
 
     def get_documents(self)->List[Dict[str,Any]]:
         return list(self._documents.values())

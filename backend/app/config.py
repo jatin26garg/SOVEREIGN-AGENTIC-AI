@@ -38,6 +38,10 @@ class Settings:
     # through in their entirety.
     MAX_FULL_DOC_CONTEXT_CHARS: int = int(os.getenv("MAX_FULL_DOC_CONTEXT_CHARS", 20000))
     
+    RAG_CACHE_MAX_ENTRIES: int = int(os.getenv("RAG_CACHE_MAX_ENTRIES", 128))
+    
+    
+    
     MAX_FILE_SIZE : int = int(os.getenv("MAX_FILE_SIZE", 10485760))
     ALLOWED_EXTENSIONS: List[str] = ['.pdf', '.docx', '.txt']
     
