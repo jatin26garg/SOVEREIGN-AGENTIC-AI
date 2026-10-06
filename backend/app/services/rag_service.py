@@ -12,7 +12,7 @@ from datetime import datetime
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatMessagePromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -45,13 +45,17 @@ class RAGService:
             use_fp16=False,
             device="cpu"
         )
-        print(f" connecting to Gemini ({settings.GEMINI_MODEL})")
-        self.llm = ChatGoogleGenerativeAI(
-            model=settings.GEMINI_MODEL,
-            google_api_key=settings.GEMINI_API_KEY,
-            temperature=0.3,
-        )
-        print(f" Gemini model is connected")
+        print(f" connecting to GroQ ({settings.GROQ_MODEL})")
+        self.llm = ChatGroq(
+                        model=settings.GROQ_MODEL,
+                        temperature=0.3,
+                        reasoning_effort="low",
+                        reasoning_format="hidden",
+                        max_retries=2,
+                        request_timeout=60,
+                    )
+        
+        print(f" GROQ_MODEL is connected")
         
         self.prompt = ChatPromptTemplate.from_template("""
                     You are a helpful assistant that answers questions based on the provided context.
@@ -112,25 +116,38 @@ ANSWER:
         )
     
     def _get_cached_query(self, key: Tuple) -> Optional[Dict[str, Any]]:
+        
+        print(f"\n ENTERED _get_cached_query FUNCTION --- \n\n\n")
         with self._query_cache_lock:
             cached = self._query_cache.get(key)
+            print(f"cached = {cached} \n\n\n")
+            print(f"_query_cache = {self._query_cache} \n\n\n")
             if cached is None:
                 self._query_cache_misses += 1
                 return None
 
             # LRU refresh: most recently used entries move to the end.
             self._query_cache.move_to_end(key)
+            print(f"_query_cache = {self._query_cache} \n\n\n")
             self._query_cache_hits += 1
+            print(f"\n EXITED _get_cached_query FUNCTION --- \n\n\n")
             return copy.deepcopy(cached)
         
     def _set_cached_query(self, key: Tuple, result: Dict[str, Any]) -> None:
+        
+        print("\n ENTERED _set_cached_query FUNCTION \n\n\n")
         with self._query_cache_lock:
             self._query_cache[key] = copy.deepcopy(result)
+            print(f"\n self._query_cache  = {self._query_cache}\n")
+            print(f"\n self._query_cache[key]  = {self._query_cache[key]}\n\n")
             self._query_cache.move_to_end(key)
+            print(f"\n self._query_cache  =  {self._query_cache} \n\n\n")
 
         max_entries = max(1, int(settings.RAG_CACHE_MAX_ENTRIES))
         while len(self._query_cache) > max_entries:
             self._query_cache.popitem(last=False)
+        print(f"\n self._query_cache  =  {self._query_cache} \n\n\n")
+        print("\n EXITED _set_cached_query FUNCTION \n\n\n")
 
     def clear_query_cache(self) -> None:
         """Clear cached RAG responses, normally after document mutations."""
@@ -527,7 +544,7 @@ ANSWER:
         
         
         print(f" generating answer --")
-        print(f"   Generating answer with {settings.GEMINI_MODEL}...")
+        print(f"   Generating answer with {settings.GROQ_MODEL}...")
 
         chain = (
             {
@@ -605,12 +622,14 @@ ANSWER:
     def query(self, question:str, top_k: int = 6)->Dict[str,Any]:
 
         cache_key = self._query_cache_key(question, top_k)
+        
+        print(f"\n\ncache_key = {cache_key} \n\n\n")
         cached_result = self._get_cached_query(cache_key)
         if cached_result is not None:
             print(f" RAG cache HIT for: {self._normalize_query(question)}")
             return cached_result
 
-        print(f" RAG cache MISS for: {self._normalize_query(question)}")
+        print(f" RAG cache MISS for: {self._normalize_query(question)} \n\n")
 
         if not self._documents:
             result = {
@@ -674,6 +693,7 @@ ANSWER:
                 "answer": "I couldn't find any relevant information in your documents.",
                 "sources": [],
             }
+            
             self._set_cached_query(cache_key, result)
             return result
         context_parts  = []

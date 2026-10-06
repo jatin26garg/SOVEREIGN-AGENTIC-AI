@@ -23,8 +23,8 @@ class Settings:
     # line (pro/flash/flash-lite) is scheduled for shutdown Oct 16 2026,
     # so avoid defaulting to those even though they're still common in
     # older examples.
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
     CHECKPOINT_DB_PATH : str = os.getenv("CHECKPOINT_DB_PATH", "")
     
@@ -62,9 +62,9 @@ class Settings:
     ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 
     def __init__(self):
-        if not self.GEMINI_API_KEY:
+        if not self.GROQ_API_KEY:
             print(
-                " WARNING: GEMINI_API_KEY is not set. Set it in your .env "
+                " WARNING: GROQ_API_KEY is not set. Set it in your .env "
                 "file - every LLM call (planning, routing, answers) will "
                 "fail with an auth error until you do."
             )

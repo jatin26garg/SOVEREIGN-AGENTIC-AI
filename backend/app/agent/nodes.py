@@ -1,7 +1,7 @@
 import re
 import json
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from app.config import settings
 from app.agent.state import AgentState
 from app.agent.tools import rag_search,write_output
@@ -14,12 +14,15 @@ from datetime import datetime
 # _clean_json()/_extract_plan_list() below still matter only as a defensive
 # second layer (e.g. in case the model wraps JSON in markdown anyway), not
 # as the primary mechanism.
-_llm = ChatGoogleGenerativeAI(
-    model=settings.GEMINI_MODEL,
-    google_api_key=settings.GEMINI_API_KEY,
+_llm = ChatGroq(
+    model=settings.GROQ_MODEL,
     temperature=0.2,
-    response_mime_type="application/json",
-)   
+    reasoning_effort="medium",
+    reasoning_format="hidden",
+    max_retries=2,
+    request_timeout=60,
+    model_kwargs={"response_format": {"type": "json_object"}},
+) 
 
 _MAX_CONVERSATION_MESSAGES = 12
 _MAX_CONVERSATION_CHARS = 8000
@@ -93,45 +96,28 @@ def _conversation_context(state: AgentState) -> str:
 
 def _clean_json(raw) -> str:
     """
-    Normalize ChatOllama content into a plain string, then clean JSON.
-    Handles both string content and list-of-content-block responses.
+    Normalize an LLM response to a string, then extract a JSON object/list.
+    Handles plain strings and provider content-block lists.
     """
-
     if isinstance(raw, list):
         parts = []
-
         for item in raw:
             if isinstance(item, str):
                 parts.append(item)
-
             elif isinstance(item, dict):
                 if "text" in item:
                     parts.append(str(item["text"]))
                 elif "content" in item:
                     parts.append(str(item["content"]))
-
         raw = "\n".join(parts)
-
     elif not isinstance(raw, str):
         raw = str(raw)
 
-    raw = re.sub(
-        r"<think>.*?</think>",
-        "",
-        raw,
-        flags=re.DOTALL
-    ).strip()
-
-    raw = raw.replace("```json", "")
-    raw = raw.replace("```", "").strip()
-
-    match = re.search(
-        r"(\{.*\}|\[.*\])",
-        raw,
-        flags=re.DOTALL
-    )
-
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    match = re.search(r"(\{.*\}|\[.*\])", raw, flags=re.DOTALL)
     return match.group(1) if match else raw
+
 
 
 def _init_node(state : AgentState) ->AgentState:
