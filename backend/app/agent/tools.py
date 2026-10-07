@@ -12,6 +12,9 @@ loggable result shape (always a dict with "success").
 
 from typing import Dict, Any
 
+from pydantic import BaseModel, Field
+from langchain_core.tools import StructuredTool
+
 from app.services.rag_service import RAGService
 from app.tools.file_tools import create_file_tool
 from app.tools.rag_tool import RAGTool
@@ -38,6 +41,48 @@ def read_input(path: str) -> Dict[str, Any]:
     """Read a text file that already lives inside the sandboxed workspace."""
     return _file_tool.read_file(path=path)
 
+
+class RagSearchInput(BaseModel):
+    """Validated arguments for the agent-facing RAG search tool."""
+    
+    query: str = Field(..., min_length=1, description="The search query to run against the indexed documents.")
+    top_k: int = Field(6, ge=1, le=20, description="Number of relevant chunks to retrieve.")
+
+
+class WriteOutputInput(BaseModel):
+    """Validated arguments for the agent-facing file-writing tool."""
+
+    path: str = Field(..., min_length=1, description="Workspace-relative output path, for example outputs/report.md.")
+    content: str = Field(..., min_length=1, description="The exact text to write to the output file.")
+
+
+RAG_SEARCH_TOOL = StructuredTool.from_function(
+    func=rag_search,
+    name="rag_search",
+    description=(
+        "Search the user's indexed documents using semantic/hybrid retrieval. "
+        "Use this when information must be retrieved from the uploaded documents."
+    ),
+    args_schema=RagSearchInput,
+)
+
+
+WRITE_OUTPUT_TOOL = StructuredTool.from_function(
+    func=write_output,
+    name="write_output",
+    description=(
+        "Write text to a file inside the sandboxed workspace. Use this when the "
+        "user asked to save, export, or write the result to a file."
+    ),
+    args_schema=WriteOutputInput,
+)
+
+AGENT_TOOLS = [RAG_SEARCH_TOOL, WRITE_OUTPUT_TOOL]
+
+AGENT_TOOL_REGISTRY = {
+    tool.name: tool
+    for tool in AGENT_TOOLS
+}
 
 # Single place to look up a tool by name - lets nodes.py log which tool a
 # step used, and lets you register a new tool in exactly one spot.

@@ -4,7 +4,7 @@ import json
 from langchain_groq import ChatGroq
 from app.config import settings
 from app.agent.state import AgentState
-from app.agent.tools import rag_search,write_output
+from app.agent.tools import rag_search,write_output,AGENT_TOOL_REGISTRY,AGENT_TOOLS,RAG_SEARCH_TOOL
 
 from datetime import datetime
 
@@ -23,6 +23,25 @@ _llm = ChatGroq(
     request_timeout=60,
     model_kwargs={"response_format": {"type": "json_object"}},
 ) 
+
+_tool_llm_base = ChatGroq(
+    model=settings.GROQ_MODEL,
+    temperature=0.1,
+    reasoning_effort="low",
+    reasoning_format="hidden",
+    max_retries=2,
+    request_timeout=60,
+)
+
+_tool_llm = _tool_llm_base.bind_tools(
+    AGENT_TOOLS,
+    tool_choice="any",
+)
+
+_retry_rag_llm = _tool_llm_base.bind_tools(
+    [RAG_SEARCH_TOOL],
+    tool_choice="rag_search",
+)
 
 _MAX_CONVERSATION_MESSAGES = 12
 _MAX_CONVERSATION_CHARS = 8000
@@ -444,6 +463,10 @@ def plan_node(state: AgentState)->AgentState:
             r"\b(that|it|this|previous\s+answer|last\s+answer|same)\b",
             task_lower,
         )
+        
+        print(f"reference_words = {bool(reference_words)} \n")
+        print(f"bool state get last_answer  = {bool(state.get("last_answer"))}")
+        
         # The most important conversational follow-up can be handled
         # deterministically: "save/write/export that/it/this" refers to the
         # checkpointed previous answer, so there is no need to ask the planner
@@ -456,6 +479,7 @@ def plan_node(state: AgentState)->AgentState:
         
         if is_reference_write:
             plan = ["save the previous assistant answer to a file"]
+            print("entered is_refrence block of plan node \n")
         else:
             
             user_content = (
@@ -466,7 +490,7 @@ def plan_node(state: AgentState)->AgentState:
                 f"Current request:\n{state['task']}"
             )
             
-            print(f"user_content = {user_content} \n\n")
+            # print(f"user_content = {user_content} \n\n")
         
             if state.get("critique_feedback"):
                 print(f"Entered critique_feedback in PLAN NODE \n")
@@ -485,10 +509,10 @@ def plan_node(state: AgentState)->AgentState:
             ])
             raw_content = resp.content
             
-            print(f"\nRAW_CONNTENT = {raw_content} \n")
+            print(f"\nRAW_CONNTENT = {raw_content} ")
     
             parsed = json.loads(_clean_json(raw_content))
-            print(f"PARSED_CONNTENT = {parsed} \n")
+            print(f"PARSED_CONNTENT = {parsed} ")
             
             plan = _extract_plan_list(parsed)
             print(f"PLAN = {plan} \n")
@@ -507,7 +531,9 @@ def plan_node(state: AgentState)->AgentState:
         print(f"FILE NAME = {filename} \n\n")
         if filename:
             state["file_path"] = f"outputs/{filename}"
-    print(f"State = {state}\n")
+            
+   
+    
     print(f"PLAN NODE END -- \n")
     return state
     
@@ -538,96 +564,198 @@ def _usable_answers(state: AgentState) -> list:
         if r.get("answer") and r.get("total_found", 1) > 0
     ]
 
+def _extract_native_tool_calls(response) -> list:
+    """Return normalized native tool calls from a LangChain AIMessage."""
+    calls = getattr(response, "tool_calls", None) or []
+    # print(f"calls = {calls} \n")
+    if not calls:
+        return []
 
-def execute_step_node(state:AgentState)->AgentState:
+    normalized = []
+    for call in calls:
+        name = str(call.get("name") or "").strip()
+        args = call.get("args") or {}
+        call_id = str(call.get("id") or "")
+        if not name:
+            continue
+        if not isinstance(args, dict):
+            raise ValueError(f"Tool arguments for {name!r} must be an object")
+        normalized.append({"id": call_id, "name": name, "args": args})
+    return normalized
+
+
+def _safe_tool_args_for_memory(tool_name: str, args: dict) -> dict:
+    """Keep tool traces useful without storing huge write payloads."""
+    safe_args = dict(args)
+    if tool_name == "write_output" and "content" in safe_args:
+        content = str(safe_args["content"])
+        safe_args["content_preview"] = content[:240]
+        safe_args["content_chars"] = len(content)
+        safe_args.pop("content", None)
+    return safe_args
+
+
+def _execute_native_tool_call(tool_call: dict) -> tuple[str, dict, dict]:
+    """Validate and execute one model-selected tool call."""
+    tool_name = tool_call["name"]
+    print(f"tool_name = {tool_name}\n")
+    tool = AGENT_TOOL_REGISTRY.get(tool_name)
+    print(f"tool = {tool}\n")
+    if tool is None:
+        raise ValueError(f"Unknown agent tool requested by Groq: {tool_name}")
+
+    args = tool_call["args"]
+    # print(f"args = {args}\n")
+    result = tool.invoke(args)
+   
+    if not isinstance(result, dict):
+        result = {"success": True, "result": result}
+    return tool_name, args, result
+
+
+def execute_step_node(state: AgentState) -> AgentState:
     """
-    Run exactly one plan step, then advance the cursor.
+    Run exactly one plan step using native Groq function calling.
 
-    Uses a cheap keyword router instead of an LLM call per step - the plan
-    step text (produced by plan_node) already encodes the intended action,
-    so a second LLM round-trip here would just add latency for no benefit.
+    The plan step is context for the model; Python no longer decides
+    "search vs. write" by looking for words such as "save" or "write".
+    Groq receives the actual tool schemas, chooses the tool, and produces
+    structured arguments. The selected StructuredTool then validates and
+    executes those arguments locally.
 
-    After a search step it also checks (deterministically, no LLM) whether
-    the retrieval failed or came back empty; if so and there's replan
-    budget left, it flags needs_replan so the graph routes through
-    replan_node instead of marching blindly to the next step.
+    After a rag_search call, the existing deterministic failure detection
+    decides whether the graph should enter the replan path.
     """
-    print(f"execute_step_node START \n")
+    print("execute_step_node START \n")
     idx = state["current_step"]
     step = state["plan"][idx]
     state["needs_replan"] = False
-    
+
     print(f"INDEX = {idx} \n")
-    print(f"STEP = {step} \n\n")
+    print(f"STEP = {step} \n")
+
+    # Give the model the exact state it needs to select and parameterize a
+    # tool, while keeping tool choice itself fully native/structured.
+    content = (
+        "You are executing exactly one step of a document agent.\n"
+        "Choose exactly one tool from the available tools and call it with "
+        "complete, valid arguments. Do not answer with prose.\n\n"
+        f"Overall user task (context only):\n{state['task']}\n\n"
+        f"CURRENT PLAN STEP — THIS IS THE ONLY ACTION TO EXECUTE:\n{step}\n\n"
+        f"Current search query from recovery logic:\n{state.get('search_query') or '(none)'}\n\n"   
+        f"Previous answer:\n{state.get('last_answer', '') or '(none)'}\n\n"
+        f"Current answer:\n{state.get('final_answer', '') or '(none)'}\n\n"
+        f"Output path hint from the application:\n{state.get('file_path') or '(none)'}\n\n"
+        f"Retrieved answers so far:\n"
+        f"{_usable_answers(state) or ['(none)']}\n\n"
+        "Rules:\n"   
+        "-PERFORM ONLY THE CURRENT PLAN STEP NOT THE OVERALL USER TASK\n"
+        "- Execute ONLY the CURRENT PLAN STEP.\n"
+        "- Do NOT execute a later or earlier plan step.\n"
+        "- The overall user task is context only; it must NOT override the current plan step.\n"
+        "- Use rag_search when this step requires retrieving information from uploaded documents.\n"
+        "- Use write_output when this step requires saving/exporting/writing a result.\n"
+        "- For rag_search, provide the best focused query and a reasonable top_k.\n"
+        "- For write_output, use the requested/output filename when one is available. "
+        "For content, use the current or previous substantive answer rather than inventing a new answer.\n"
+    )
     
-    
-    is_write_step = any(kw in step.lower() for kw in _WRITE_KEYWORDS)
-    
-    print(f"is_write_step = {is_write_step}\n\n")
-    
+    # print(f"content = {content} \n")
+
+    raw_response = None
+    result = {"success": False, "error": "tool execution did not run"}
     failure = None
-    
-    if is_write_step:
+    tool_name = None
+    tool_args = {}
+    selected_call = None
+    forced_retry = bool(state.get("search_query"))
+
+    try:
+        tool_llm = _retry_rag_llm if forced_retry else _tool_llm
+        raw_response = tool_llm.invoke([
+            {
+                "role": "system",
+                "content": (
+                    "You are the execution controller. Use native function calling only. "
+                    "Never return a plain-text answer."
+                ),
+            },
+            {"role": "user", "content": content},
+        ])
         
-        content = (
-            state["final_answer"]
-            or state.get("last_answer", "")
-            or "\n\n".join(_usable_answers(state))
-        )
-                
-        if not content.strip():
-            # Don't write an empty/placeholder file - a saved "nothing
-            # found" file looks like a successful result but isn't one.
-            result = {"success": False, "error": "nothing to write yet - no answer was produced"}
-            state["errors"].append(result["error"])
-        else:
-            path = state["file_path"]  or "outputs/agent_answer.md" 
-            print(f"path = {path}\n\n")
-            result = write_output(path=path, content=content)
+        # print(f"raw_response = {raw_response} \n")
+
+        tool_calls = _extract_native_tool_calls(raw_response)
+        # print(f"tool_calls = {tool_calls} \n")
+        if not tool_calls:
+            raise ValueError(
+                "Groq returned no native tool call for execute_step; "
+                "the executor will not fall back to keyword routing"
+            )
+        if len(tool_calls) > 1:
+            raise ValueError(
+                f"Groq returned {len(tool_calls)} tool calls for one plan step; "
+                "parallel tool execution is not enabled in this executor"
+            )
+
+        selected_call = tool_calls[0]
+        tool_name, tool_args, result = _execute_native_tool_call(selected_call)
+        
+        # print(f"NATIVE TOOL CALL = {tool_name}({tool_args})")
+        
+
+    except Exception as e:
+        result = {"success": False, "error": str(e)}
+        state["errors"].append(f"native tool execution failed: {e}")
+        print(f"native tool execution error = {e} \n")
+
+    # Store both a compact human-readable call record and structured memory.
+    if tool_name:
+        if tool_name == "rag_search":
+            query = str(tool_args.get("query", ""))
+            state.setdefault("tried_queries", []).append(query)
+            state["tool_calls"].append(f"rag_search({query[:60]!r})")
+        elif tool_name == "write_output":
+            path = str(tool_args.get("path", ""))
             state["tool_calls"].append(f"write_output({path})")
-            
-            if not result.get("success"):
-                state["errors"].append(result.get("error", "write_output failed"))
-            else:
-                state["file_path"] = result["path"]
-                state["last_file_path"] = result["path"]
-                if not state.get("final_answer") and state.get("last_answer"):
-                    # Conversational "save that/it" follow-up: retain the
-                    # previous substantive answer in last_answer, while this
-                    # turn returns a concise save confirmation.
-                    state["preserve_last_answer"] = True
-                    state["final_answer"] = f"Saved the previous answer to {result['path']}."
-    else:
-        # A replan may have supplied a rewritten query; otherwise use the task.
-        query = state.get("search_query") or state["task"]
-        
-        
-        print(f"RAG BLOCK \n\n")
-        print(f"query = {query} \n\n")
-        
-        result = rag_search(query=query)
-        
-        
-        print(f"RAG_SEARCH RESULT = {result} \n\n")
-        state["tool_calls"].append(f"rag_search({query[:60]!r})")
-        state.setdefault("tried_queries", []).append(query)
-        
-        failure = _classify_search_failure(result)
-        
+
+    failure = _classify_search_failure(result) if tool_name == "rag_search" else None
+
+    if tool_name == "rag_search":
         if result.get("success"):
             state["rag_results"].append(result)
-            # Keep a running best-answer so a later write step (or
-            # finalize, if the plan has no write step) always has
-            # concrete content to work with.
             if result.get("answer"):
                 state["final_answer"] = result["answer"]
         else:
             state["errors"].append(result.get("error", "rag_search failed"))
-            
-    state["memory"].append({"node": "execute_step", "step": step, "result": result})
+
+        # The recovery query is a one-shot override for this execution. If
+        # another search is needed, replan_node will install a fresh query.
+        state["search_query"] = ""
+
+    elif tool_name == "write_output":
+        if result.get("success"):
+            state["file_path"] = result["path"]
+            state["last_file_path"] = result["path"]
+            if not state.get("final_answer") and state.get("last_answer"):
+                state["preserve_last_answer"] = True
+                state["final_answer"] = f"Saved the previous answer to {result['path']}."
+        else:
+            state["errors"].append(result.get("error", "write_output failed"))
+
+    state["memory"].append({
+        "node": "execute_step",
+        "step": step,
+        "tool": tool_name,
+        "tool_call_id": selected_call.get("id") if selected_call else None,
+        "tool_args": _safe_tool_args_for_memory(tool_name or "", tool_args),
+        "result": result,
+        "native_function_call": bool(tool_name),
+    })
+
     state["current_step"] += 1
-    state["iteration"] +=1
-    print(f"failure = {failure} \n\n")
+    state["iteration"] += 1
+
     if failure:
         has_budget = (
             state.get("replan_count", 0) < state.get("max_replans", 2)
@@ -635,14 +763,17 @@ def execute_step_node(state:AgentState)->AgentState:
         )
         if has_budget:
             state["needs_replan"] = True
+            query_for_failure = str(tool_args.get("query", state.get("search_query", "")))
             state["last_failure"] = {
                 "step": step,
-                "query": query,
+                "query": query_for_failure,
                 "kind": failure["kind"],
                 "detail": failure["detail"],
             }
-    print(f"STATE = {state} \n \n \n")
-    print(f"execute_step_node END \n")
+
+    print(f"failure = {failure} \n\n")
+    
+    print("execute_step_node END \n")
     return state
 
 def should_continue(state:AgentState)->str:
@@ -865,6 +996,7 @@ def critique_node(state: AgentState) -> AgentState:
     state.setdefault("max_critiques", 2)
 
     if state.get("unrecoverable"):
+        print("STATE IS unrecoverable ")
         # replan_node already concluded nothing more can be done (e.g. no
         # documents uploaded). Reflecting would only score the honest
         # apology poorly and burn retries on a problem no replan can fix.
@@ -887,6 +1019,7 @@ def critique_node(state: AgentState) -> AgentState:
         raw_content = resp.content
         parsed = json.loads(_clean_json(raw_content))
         critique = _extract_critique(parsed)
+        print(f"critique = {critique}")
         if critique is None:
             raise ValueError(f"critique returned malformed output (raw: {raw_content!r})")
     except Exception as e:

@@ -120,15 +120,15 @@ ANSWER:
         print(f"\n ENTERED _get_cached_query FUNCTION --- \n\n\n")
         with self._query_cache_lock:
             cached = self._query_cache.get(key)
-            print(f"cached = {cached} \n\n\n")
-            print(f"_query_cache = {self._query_cache} \n\n\n")
+            print(f"cached =  \n\n\n")
+            print(f"_query_cache =  \n\n\n")
             if cached is None:
                 self._query_cache_misses += 1
                 return None
 
             # LRU refresh: most recently used entries move to the end.
             self._query_cache.move_to_end(key)
-            print(f"_query_cache = {self._query_cache} \n\n\n")
+            print(f"_query_cache = \n\n\n")
             self._query_cache_hits += 1
             print(f"\n EXITED _get_cached_query FUNCTION --- \n\n\n")
             return copy.deepcopy(cached)
@@ -138,15 +138,15 @@ ANSWER:
         print("\n ENTERED _set_cached_query FUNCTION \n\n\n")
         with self._query_cache_lock:
             self._query_cache[key] = copy.deepcopy(result)
-            print(f"\n self._query_cache  = {self._query_cache}\n")
-            print(f"\n self._query_cache[key]  = {self._query_cache[key]}\n\n")
+            print(f"\n self._query_cache  = \n")
+            print(f"\n self._query_cache[key]  = \n\n")
             self._query_cache.move_to_end(key)
-            print(f"\n self._query_cache  =  {self._query_cache} \n\n\n")
+            print(f"\n self._query_cache  =  \n\n\n")
 
         max_entries = max(1, int(settings.RAG_CACHE_MAX_ENTRIES))
         while len(self._query_cache) > max_entries:
             self._query_cache.popitem(last=False)
-        print(f"\n self._query_cache  =  {self._query_cache} \n\n\n")
+        print(f"\n self._query_cache  =  \n\n\n")
         print("\n EXITED _set_cached_query FUNCTION \n\n\n")
 
     def clear_query_cache(self) -> None:
@@ -540,7 +540,7 @@ ANSWER:
         print("_answer_from_context \n\n\n\n")
         context = "\n\n".join(context_parts)
 
-        print(f"CONTEXT = {context } \n\n\n")
+        print(f"CONTEXT =  \n\n\n")
         
         
         print(f" generating answer --")
