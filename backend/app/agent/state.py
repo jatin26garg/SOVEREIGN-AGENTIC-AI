@@ -25,6 +25,12 @@ class AgentState(TypedDict, total = False):
     errors: List[str]
     start_time : str
     
+    previous_attempt_answer: str
+    previous_attempt_plan: List[str]
+    previous_attempt_tool_calls: List[str]
+    reflection_retry: bool
+    attempt_tool_calls: List[str]
+    
     iteration: int                     
     tool_calls: List[str]
 

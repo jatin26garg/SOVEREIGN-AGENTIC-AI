@@ -437,25 +437,44 @@ def plan_node(state: AgentState)->AgentState:
     steps. One planning call up front is far cheaper than re-planning on
     every step, and is sufficient for this agent's two-tool workflow
     (retrieve from PDFs, optionally save the result to a file).
-    """
-    
-    system = (
-        "Break the user's task into 1-4 short, concrete steps for an agent "
-        "with exactly two tools:\n"
-        "  - rag_search: retrieves an answer from the user's uploaded PDFs\n"
-        "  - write_output: saves text to a file\n\n"
-        "Only include a write_output step if the user explicitly asked to "
-        "save, export, or write the result to a file.\n"
-        'Respond with ONLY a JSON object of the form {"steps": [...]}, '
-        "where the value is a list of short step strings, nothing else. "
-        'Example: {"steps": ["Search the PDFs for the refund policy", '
-        '"Save the answer to refund_policy.md"]}.\n'
-        "The user may refer to an earlier answer with words such as 'it', 'that', "
-        "'this', or 'the previous answer'. Resolve those references using the "
-        "conversation context. A request such as 'save that' should become a "
-        "write_output step that uses the previous assistant answer."
-    )
-    
+    """ 
+    reflection_retry = bool(state.get("reflection_retry") and state.get("critique_feedback"))
+    print(f"reflection_retry = {reflection_retry}\n")
+    if reflection_retry:
+        system = (
+            "You are replanning a document-agent task after the previous "
+            "attempt was judged insufficient. Create 1-4 short, concrete "
+            "CORRECTIVE steps using the available tools:\n"
+            "  - rag_search: retrieves information from the user's uploaded PDFs\n"
+            "  - write_output: saves text to a file\n\n"
+            "Do NOT blindly repeat the previous plan. Reuse information that "
+            "was already retrieved when it is still valid. Add a new, focused "
+            "rag_search only when the critique identifies missing or unreliable "
+            "information. Use write_output when the revised answer must be saved.\n"
+            "The new plan should address the critique with the minimum useful "
+            "set of actions. A different search query is preferred over repeating "
+            "an already-tried query.\n"
+            'Respond with ONLY a JSON object of the form {"steps": [...]}, '
+            "where the value is a list of short step strings, nothing else."
+        )
+    else:
+        system = (
+            "Break the user's task into 1-4 short, concrete steps for an agent "
+            "with exactly two tools:\n"
+            "  - rag_search: retrieves an answer from the user's uploaded PDFs\n"
+            "  - write_output: saves text to a file\n\n"
+            "Only include a write_output step if the user explicitly asked to "
+            "save, export, or write the result to a file.\n"
+            'Respond with ONLY a JSON object of the form {"steps": [...]}, '
+            "where the value is a list of short step strings, nothing else. "
+            'Example: {"steps": ["Search the PDFs for the refund policy", '
+            '"Save the answer to refund_policy.md"]}.\n'
+            "The user may refer to an earlier answer with words such as 'it', 'that', "
+            "'this', or 'the previous answer'. Resolve those references using the "
+            "conversation context. A request such as 'save that' should become a "
+            "write_output step that uses the previous assistant answer."
+        )
+        
     raw_content = None
     try:
         task_lower = state["task"].lower()
@@ -492,29 +511,38 @@ def plan_node(state: AgentState)->AgentState:
             
             # print(f"user_content = {user_content} \n\n")
         
-            if state.get("critique_feedback"):
-                print(f"Entered critique_feedback in PLAN NODE \n")
+            if reflection_retry:
+                print(f"Entered reflection_retry in PLAN NODE \n")
                 # This is a retry after a reflection cycle judged the previous
                 # answer insufficient - tell the planner what was wrong so it
                 # doesn't just regenerate the same plan and fail the same way.
                 user_content += (
-                    f"\n\nNote: a previous attempt at this task was judged "
-                    f"insufficient. Feedback: {state['critique_feedback']}\n"
-                    f"Try a different or more thorough approach this time."
+                    "\n\nPREVIOUS ATTEMPT THAT WAS JUDGED INSUFFICIENT:\n"
+                    f"Previous plan: {state.get('previous_attempt_plan') or ['(none)']}\n"
+                    f"Previous answer: {state.get('previous_attempt_answer') or '(none)'}\n"
+                    f"Previous tool calls: {state.get('previous_attempt_tool_calls') or ['(none)']}\n"
+                    f"Critique feedback: {state.get('critique_feedback') or '(none)'}\n"
+                    f"Search queries already tried: {state.get('tried_queries') or ['(none)']}\n\n"
+                    "Create a corrective plan. Do not simply replay the previous "
+                    "plan. Preserve useful evidence mentally, target whatever is "
+                    "missing according to the critique, and only repeat an action "
+                    "when the critique shows that it actually needs to be redone."
                 )
-
+            print(f"user_content = {user_content}\n")
             resp = _llm.invoke([
                 {"role" : "system",  "content" : system},
                 {"role" : "user" , "content" : user_content}
             ])
             raw_content = resp.content
             
-            print(f"\nRAW_CONNTENT = {raw_content} ")
+            # print(f"\nRAW_CONNTENT =  ")
     
             parsed = json.loads(_clean_json(raw_content))
-            print(f"PARSED_CONNTENT = {parsed} ")
+            
+            # print(f"PARSED_CONNTENT =  ")
             
             plan = _extract_plan_list(parsed)
+            
             print(f"PLAN = {plan} \n")
     
             if not plan:
@@ -525,15 +553,19 @@ def plan_node(state: AgentState)->AgentState:
         state['errors'].append(f"plan_node fallback used : {e}")
         
     state['plan'] = plan
-    state['memory'].append({"node" : "plan" , "plan" : plan, "raw_llm_response": raw_content})
+    state['memory'].append(
+            {
+                "node" : "plan" , 
+                "plan" : plan,
+                "raw_llm_response": raw_content,
+                "reflection_retry": reflection_retry,
+            })
     if not state.get("file_path"):
         filename = _extract_filename(state["task"])
         print(f"FILE NAME = {filename} \n\n")
         if filename:
             state["file_path"] = f"outputs/{filename}"
-            
-   
-    
+     
     print(f"PLAN NODE END -- \n")
     return state
     
@@ -612,6 +644,24 @@ def _execute_native_tool_call(tool_call: dict) -> tuple[str, dict, dict]:
         result = {"success": True, "result": result}
     return tool_name, args, result
 
+def _normalize_search_query_for_guard(query: str) -> str:
+    """Normalize a query only for duplicate-attempt detection."""
+    return " ".join(str(query).casefold().split())
+
+
+def _already_tried_query(state: AgentState, query: str) -> bool:
+    """Return True when this exact normalized query was already attempted."""
+    print("checking for _already_tried_query \n")
+    normalized = _normalize_search_query_for_guard(query)
+    if not normalized:
+        return False
+    tried = {
+        _normalize_search_query_for_guard(item)
+        for item in state.get("tried_queries", [])
+        if str(item).strip()
+    }
+    return normalized in tried
+
 
 def execute_step_node(state: AgentState) -> AgentState:
     """
@@ -659,7 +709,14 @@ def execute_step_node(state: AgentState) -> AgentState:
         "- For write_output, use the requested/output filename when one is available. "
         "For content, use the current or previous substantive answer rather than inventing a new answer.\n"
     )
-    
+    if state.get("reflection_retry"):
+        content += (
+            "\nREFLECTION RETRY CONTEXT:\n"
+            f"Previous attempt answer: {state.get('previous_attempt_answer') or '(none)'}\n"
+            f"Critique feedback: {state.get('critique_feedback') or '(none)'}\n"
+            "Use this context only to execute the CURRENT PLAN STEP. Do not "
+            "jump ahead to a future write step while performing a retrieval step."
+        )
     # print(f"content = {content} \n")
 
     raw_response = None
@@ -699,7 +756,32 @@ def execute_step_node(state: AgentState) -> AgentState:
             )
 
         selected_call = tool_calls[0]
-        tool_name, tool_args, result = _execute_native_tool_call(selected_call)
+        requested_tool = str(selected_call.get("name") or "")
+        requested_args = selected_call.get("args") or {}
+        
+        print(f"selected_call = {selected_call}")
+        print(f"requested_tool = {requested_tool}")
+        print(f"requested_args = {requested_args}\n")
+        
+        if requested_tool == "rag_search":
+            requested_query = str(requested_args.get("query") or "").strip()
+            if _already_tried_query(state, requested_query):
+                print("this _already_tried_query \n")
+                tool_name = requested_tool
+                tool_args = dict(requested_args)
+                result = {
+                    "success": False,
+                    "error": (
+                        "This exact search query was already attempted. "
+                        "A new query is required for recovery."
+                    ),
+                    "blocked_duplicate_query": True,
+                }
+                print(f"BLOCKED DUPLICATE SEARCH = {requested_query}\n")
+            else:
+                tool_name, tool_args, result = _execute_native_tool_call(selected_call)
+        else:
+            tool_name, tool_args, result = _execute_native_tool_call(selected_call)
         
         # print(f"NATIVE TOOL CALL = {tool_name}({tool_args})")
         
@@ -713,11 +795,20 @@ def execute_step_node(state: AgentState) -> AgentState:
     if tool_name:
         if tool_name == "rag_search":
             query = str(tool_args.get("query", ""))
-            state.setdefault("tried_queries", []).append(query)
+            if query and not _already_tried_query(state, query):
+                state.setdefault("tried_queries", []).append(query)
+                print(f"tried_queries = {state.get("tried_queries")}\n")
+                
+            if not result.get("blocked_duplicate_query"):
+                call_record = f"rag_search({query[:60]!r})"
+                state["tool_calls"].append(call_record)
+                state.setdefault("attempt_tool_calls", []).append(call_record)
             state["tool_calls"].append(f"rag_search({query[:60]!r})")
         elif tool_name == "write_output":
             path = str(tool_args.get("path", ""))
+            call_record = f"write_output({path})"
             state["tool_calls"].append(f"write_output({path})")
+            state.setdefault("attempt_tool_calls", []).append(call_record)
 
     failure = _classify_search_failure(result) if tool_name == "rag_search" else None
 
@@ -735,14 +826,39 @@ def execute_step_node(state: AgentState) -> AgentState:
 
     elif tool_name == "write_output":
         if result.get("success"):
+            print("GOT SUCCESS IN WRITE OUTPUT TOOL")
+
             state["file_path"] = result["path"]
             state["last_file_path"] = result["path"]
-            if not state.get("final_answer") and state.get("last_answer"):
-                state["preserve_last_answer"] = True
-                state["final_answer"] = f"Saved the previous answer to {result['path']}."
-        else:
-            state["errors"].append(result.get("error", "write_output failed"))
 
+            confirmation = f"Saved successfully to: {result['path']}."
+
+            # Keep the current answer, or restore the previous answer
+            # when this is a "save that" follow-up.
+            answer = (
+                state.get("final_answer", "").strip()
+                or state.get("last_answer", "").strip()
+            )
+
+            # Avoid appending the same confirmation multiple times.
+            if confirmation not in answer:
+                if answer:
+                    state["final_answer"] = (
+                        f"{answer}\n\n{confirmation}"
+                    )
+                else:
+                    state["final_answer"] = confirmation
+
+            # Preserve conversational memory for "save that" requests.
+            if not state.get("final_answer") or (
+                not state.get("final_answer", "").strip()
+            ):
+                state["final_answer"] = confirmation
+
+        else:
+            state["errors"].append(
+                result.get("error", "write_output failed")
+            )
     state["memory"].append({
         "node": "execute_step",
         "step": step,
@@ -1010,6 +1126,7 @@ def critique_node(state: AgentState) -> AgentState:
 
     raw_content = None
     try:
+        print(f"state['final_answer'] = {state['final_answer']}")
         resp = _llm.invoke([
             {"role": "system", "content": _CRITIQUE_SYSTEM},
             {"role": "user", "content": (
@@ -1040,8 +1157,15 @@ def critique_node(state: AgentState) -> AgentState:
 
     state["needs_retry"] = should_retry
     if should_retry:
+        
+        state["previous_attempt_answer"] = state.get("final_answer", "")
+        state["previous_attempt_plan"] = list(state.get("plan", []))
+        state["previous_attempt_tool_calls"] = list(state.get("attempt_tool_calls", []))
+        
         state["critique_count"] += 1
         state["current_step"] = 0
+        state["reflection_retry"] = True
+        state["attempt_tool_calls"] = []
         # Each critique-driven attempt gets its own replan budget and
         # starts from the original query, not a previous attempt's rewrite
         # (tried_queries is kept so the replanner won't repeat old rewrites).
@@ -1054,11 +1178,16 @@ def critique_node(state: AgentState) -> AgentState:
         # answer that was just judged insufficient if the retry's search
         # step comes back empty too.
         state["final_answer"] = ""
-
+        
+    else:
+        state["reflection_retry"] = False
+        
     state["memory"].append({
         "node": "critique",
         "critique": critique,
         "will_retry": should_retry,
+        "previous_attempt_answer_saved": bool(state.get("previous_attempt_answer")) if should_retry else False,
+        "previous_attempt_plan_saved": bool(state.get("previous_attempt_plan")) if should_retry else False,
         "raw_llm_response": raw_content,
     })
     

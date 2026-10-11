@@ -34,6 +34,7 @@ def rag_search(query: str, top_k: int = 6) -> Dict[str, Any]:
 
 def write_output(path: str, content: str) -> Dict[str, Any]:
     """Persist text to the sandboxed workspace via FileSystemTool."""
+    print("entered write_output function ")
     return _file_tool.write_file(path=path, content=content, overwrite=True)
 
 
@@ -51,7 +52,7 @@ class RagSearchInput(BaseModel):
 
 class WriteOutputInput(BaseModel):
     """Validated arguments for the agent-facing file-writing tool."""
-
+    print("entered WriteOutputInput class")
     path: str = Field(..., min_length=1, description="Workspace-relative output path, for example outputs/report.md.")
     content: str = Field(..., min_length=1, description="The exact text to write to the output file.")
 

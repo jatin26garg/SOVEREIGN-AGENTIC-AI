@@ -76,6 +76,7 @@ class FileSystemTool:
     def _validate_size(self, size : int, max_size : int , operation:  str = "read") ->None:
         
         if size > max_size:
+            print("CONTENT IS VERT LONG , CAN'T FIT IN THE FILE")
             size_mb = size(1024*1024)
             max_mb = size(1024*1024)
             raise ValueError(
@@ -127,11 +128,14 @@ class FileSystemTool:
             }
     def write_file(self, path : Union[str, Path], content :str, encoding:str = "utf-8",overwrite:bool = True)->Dict[str, Any]:
         
+        print("writing the file \n")
         try:
+            print(f"content = {content}\n")
             resolved_path = self._resolve_path(path)
             self._validate_extentions(resolved_path, self.allowed_write_extentions)
             
             if  resolved_path.exists() and not overwrite:
+                print("cant overwrite this file")
                 raise ValueError(
                     f"File {resolved_path} already exists. "
                     f"Set overwrite=True to replace it."
@@ -148,6 +152,7 @@ class FileSystemTool:
                 "encoding": encoding,
                 "overwrite": overwrite,
             })
+            print(" done writing the file  \n")
             return {
                 "success": True,
                 "path": str(resolved_path),
